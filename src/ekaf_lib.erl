@@ -11,7 +11,7 @@
 
          %% read configs per topic
          get_bootstrap_broker/0, get_bootstrap_topics/0, get_max_buffer_size/1, get_concurrency_opts/1, get_buffer_ttl/1, get_default/3, get_callbacks/1,
-         get_pool_name/1, get_topic_as_atom/1,
+         get_pool_name/1, get_topic_as_atom/1, get_compression_codec/0,
 
          %% networking
          open_socket/1, close_socket/1,
@@ -352,6 +352,14 @@ get_bootstrap_topics()->
             {ok,L};
         _ ->
             {ok,[]}
+    end.
+
+get_compression_codec()->
+    case application:get_env(ekaf, ekaf_compression_codec) of
+        {ok,Codec}->
+            {ok,Codec};
+        _ ->
+            {ok,none}
     end.
 
 get_concurrency_opts(Topic)->
