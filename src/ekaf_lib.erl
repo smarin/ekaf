@@ -6,13 +6,14 @@
          %% API
          prepare/1, prepare/2,
          common_async/3,
-         common_sync/3, common_sync/4,
+         common_sync/3, common_sync/4, common_sync/5,
          start_child/5, stop_child/1,
 
          %% read configs per topic
          get_bootstrap_broker/0, get_bootstrap_topics/0, get_max_buffer_size/1,
          get_max_downtime_buffer_size/1,
-         get_concurrency_opts/1, get_buffer_ttl/1, get_default/3,
+         get_concurrency_opts/1, get_buffer_ttl/1, open_socket_if_statsd_enabled/1,
+         get_default/3,
          get_pool_name/1,
          get_compression_codec/0,
 
@@ -28,7 +29,10 @@
          %% helpers
          data_to_message_sets/1, data_to_message_set/1,response_to_proplist/1,
          add_message_to_buffer/2, pop_messages_from_buffer/2, add_messages_to_sent/2,
-         flush_messages_callback/1, flushed_messages_replied_callback/2
+         flush_messages_callback/1, flushed_messages_replied_callback/2,
+
+         %% metadata helpers
+         partitions/1
 ]).
 
 prepare(Topic)->
@@ -36,7 +40,7 @@ prepare(Topic)->
                          {Topic, {ekaf_server, start_link, [[Topic]]},
                           transient, infinity, worker, []}
                         ),
-    Pid = (catch gproc:where({n,l,Topic})),
+    Pid = (catch gproc:where({n,l,?PREFIX_EKAF(Topic)})),
     case Pid of
         SomePid when is_pid(SomePid)->
             gen_fsm:sync_send_event(Pid, prepare);
@@ -59,6 +63,35 @@ prepare(Topic, Callback)->
             ok
     end.
 
+%% When a key is passed, it is assumed that you will shard it to a partition
+%% if a callback fails or is not found, a default strategy will be chosen
+common_async(Event, Topic, {Key,Data})->
+    common_async(Event, Topic, [{Key,Data}]);
+common_async(_, _, [])->
+    ok;
+common_async(Event, Topic, [{Key,Data}|Rest])->
+    case gproc:where({n,l,?PREFIX_EKAF(Topic)}) of
+        undefined ->
+            prepare(Topic, fun(_)->
+                                   common_async(Event, Topic, {Key,Data})
+                           end);
+        TopicWorker ->
+            TopicWorker ! {pick, {Key,Data}, self()},
+            receive
+                {ok,Worker} ->
+                    case Worker of
+                        {error,{retry,_N}} ->
+                            common_async(Event, Topic, {Key,Data});
+                        {error,_}=E ->
+                            E;
+                        _ ->
+                            gen_fsm:send_event(Worker, {Event, [{Key,Data}]}),
+                            common_async(Event, Topic, Rest)
+                    end;
+                _E ->
+                    common_async(Event, Topic, Rest)
+            end
+    end;
 %% Pick a worker, and pass it into the callback
 %% usually, callback(worker) blocks on the worker
 %% but ekaf:pick creates a new process that blocks instead
@@ -76,28 +109,72 @@ common_async(Event, Topic, Data)->
                      end),
     ok.
 
+%% When a key is passed, it is assumed that you will shard it to a partition
+%% if a callback fails or is not found, a default strategy will be chosen
 common_sync(Event, Topic, Data)->
     common_sync(Event, Topic, Data, ?EKAF_SYNC_TIMEOUT).
+common_sync(Event, Topic, {Key,Data}, Timeout)->
+    common_sync(Event, Topic, [{Key,Data}], Timeout);
+common_sync(Event, Topic, [{_Key,_}|_]=Data, Timeout)->
+    common_sync(Event, Topic, Data, Timeout, []);
 common_sync(Event, Topic, Data, Timeout)->
     Worker = ekaf:pick(Topic),
     case Worker of
         {error,{retry,_N}} ->
-            common_sync(Event, Topic, Data);
+            common_sync(Event, Topic, Data, Timeout);
         {error,_}=E ->
             E;
         _ ->
             gen_fsm:sync_send_event(Worker, {Event, Data}, Timeout)
     end.
+common_sync(_, _, [], _, Results)->
+    lists:reverse(Results);
+common_sync(Event, Topic, [{Key,Data}|Rest]=AllData, Timeout, Results)->
+    case gproc:where({n,l,?PREFIX_EKAF(Topic)}) of
+        undefined ->
+            prepare(Topic, fun(_)->
+                                   common_sync(Event, Topic, AllData, Timeout, Results)
+                           end);
+        TopicWorker ->
+            TopicWorker ! {pick, {Key,Data}, self()},
+            receive
+                {ok,Worker} ->
+                    case Worker of
+                        {error,{retry,_N}} ->
+                            common_sync(Event, Topic, {Key,Data}, Timeout, Results);
+                        {error,_}=E ->
+                            E;
+                        _ ->
+                            CurrResult = gen_fsm:sync_send_event(Worker, {Event, [{Key,Data}]}),
+                            common_sync(Event, Topic, Rest, Timeout, [CurrResult | Results])
+                    end;
+                _E ->
+                    common_sync(Event, Topic, Rest, Timeout, [_E|Results])
+            end
+    end.
 
 cursor(_,[], State)->
     {[], State};
-cursor(BatchEnabled,Messages,#ekaf_fsm{ to_buffer = _ToBuffer}=State)->
+cursor(BatchEnabled,Messages,#ekaf_fsm{ to_buffer = _ToBuffer, topic = Topic }=State)->
     case BatchEnabled of
         true ->
             %% only timeout sends messages every BufferTTL ms
             ekaf_lib:add_message_to_buffer(Messages,State);
         _ ->
-            {ekaf_lib:data_to_message_sets(Messages), State#ekaf_fsm{ cor_id =  State#ekaf_fsm.cor_id+1}}
+            Callback = ekaf_lib:get_default(Topic, ?EKAF_CALLBACK_MASSAGE_BUFFER_ATOM, undefined),
+            MessageSets = case Callback of
+                              {CallbackModule,CallbackFunction} ->
+                                  CallbackModule:CallbackFunction
+                                    (?EKAF_CALLBACK_MASSAGE_BUFFER,
+                                     self(),
+                                     ready,
+                                     State,
+                                     lists:reverse(Messages));
+                              undefined ->
+                                  ekaf_lib:data_to_message_sets(Messages)
+                          end,
+            {MessageSets,
+             State#ekaf_fsm{ cor_id =  State#ekaf_fsm.cor_id+length(MessageSets)}}
     end.
 
 handle_reply_when_not_ready(During,  Event, _From, State)->
@@ -118,11 +195,23 @@ spawn_inactivity_timeout([],State)->
     State;
 spawn_inactivity_timeout(_,#ekaf_fsm{socket = undefined} = State)->
     State;
-spawn_inactivity_timeout(Messages, #ekaf_fsm{cor_id = CorId, client_id = ClientId, socket = Socket, topic_packet = DefTopicPacket, partition_packet = DefPartitionPacket, produce_packet = DefProducePacket} = State)->
+spawn_inactivity_timeout(Messages, #ekaf_fsm{cor_id = CorId, client_id = ClientId, socket = Socket, topic_packet = DefTopicPacket,
+                                             partition_packet = DefPartitionPacket, produce_packet = DefProducePacket, topic = Topic} = State)->
     Self = self(),
     spawn(
       fun()->
-              MessageSets = ekaf_lib:data_to_message_sets(Messages),
+              Callback = ekaf_lib:get_default(Topic, ?EKAF_CALLBACK_MASSAGE_BUFFER_ATOM, undefined),
+              MessageSets = case Callback of
+                                {CallbackModule,CallbackFunction} ->
+                                    CallbackModule:CallbackFunction
+                                      (?EKAF_CALLBACK_MASSAGE_BUFFER,
+                                       self(),
+                                       ready,
+                                       State,
+                                       lists:reverse(Messages));
+                                undefined ->
+                                    ekaf_lib:data_to_message_sets(Messages)
+                            end,
               case MessageSets of
                   [] ->
                       ok;
@@ -141,8 +230,7 @@ spawn_inactivity_timeout(Messages, #ekaf_fsm{cor_id = CorId, client_id = ClientI
                                                    }]
                                        },
                       Request = ekaf_protocol:encode_sync(CorId, ClientId, ProducePacket),
-                      ekaf_socket:fork(Self, Socket, {send, produce_sync, Request}),
-                      ?DEBUG_MSG("send cor_id:~p ~p",[CorId,Messages])
+                      ekaf_socket:fork(Self, Socket, {send, produce_sync, Request})
               end
       end),
     State.
@@ -250,7 +338,7 @@ add_messages_to_sent(Messages, #ekaf_fsm{ kv = KV, cor_id = CorId } = State)->
 flush_messages_callback(State)->
     Self = self(),
     spawn(fun()->
-                  FlushCallback = ekaf_callbacks:find(?EKAF_CALLBACK_FLUSH),
+                  FlushCallback = ekaf_callbacks:find(?EKAF_CALLBACK_FLUSH_ATOM),
                   case FlushCallback of
                       {FlushCallbackModule,FlushCallbackFunction} ->
                           FlushCallbackModule:FlushCallbackFunction(?EKAF_CALLBACK_FLUSH, Self, ready, State, undefined);
@@ -264,7 +352,7 @@ flushed_messages_replied_callback(State, Packet)->
     spawn(fun()->
                   Reply = {{replied, State#ekaf_fsm.partition, Self},
                            ekaf_protocol:decode_produce_response(Packet)},
-                  FlushCallback = ekaf_callbacks:find(?EKAF_CALLBACK_FLUSHED_REPLIED),
+                  FlushCallback = ekaf_callbacks:find(?EKAF_CALLBACK_FLUSHED_REPLIED_ATOM),
                   case FlushCallback of
                       {FlushCallbackModule,FlushCallbackFunction} ->
                           FlushCallbackModule:FlushCallbackFunction(?EKAF_CALLBACK_FLUSHED_REPLIED, Self, ready, State, {ok,Reply});
@@ -389,28 +477,39 @@ get_max_downtime_buffer_size(Topic)->
 get_buffer_ttl(Topic)->
     get_default(Topic, ekaf_buffer_ttl, ?EKAF_DEFAULT_BUFFER_TTL).
 
+open_socket_if_statsd_enabled(Topic) ->
+    case get_default(Topic, ?EKAF_PUSH_TO_STATSD_ENABLED, ?EKAF_DEFAULT_PUSH_TO_STATSD_ENABLED) of
+        true ->
+            %% workers will maintain a udp socket to localhost:8125
+            %% callbacks can then use #ekaf_server.statsd_socket, #ekaf_fsm.statsd_socket
+            %% to pushing metrics, using ekaf_stats:udp_incr(Socket, Metric) for counters
+            %% and ekaf_stats:udp_gauge(Socket, Metric, Int) for gauges
+            case gen_udp:open(0,[binary]) of
+                {ok, _StatsSocket} ->
+                    _StatsSocket;
+                _E ->
+                    undefined
+            end;
+        _E ->
+            undefined
+    end.
+
 get_default(Topic, Key, Default)->
     case application:get_env(ekaf,Key) of
         {ok,L} when is_list(L)->
-            case proplists:get_value(Topic, L) of
-                TopicAtom when is_atom(TopicAtom), TopicAtom =/= undefined->
-                    TopicAtom;
-                TopicMax when is_integer(TopicMax) ->
-                    TopicMax;
+            case lists:keyfind(Topic, 1, L) of
+                {_,TopicData} ->
+                    TopicData;
                 _ ->
-                    case proplists:get_value(Key, L) of
-                        TopicAtom when is_atom(TopicAtom), TopicAtom =/= undefined->
-                            TopicAtom;
-                        TopicMax when is_integer(TopicMax) ->
-                            TopicMax;
+                    case lists:keyfind(Key, 1, L) of
+                        {_,TopicData} ->
+                            TopicData;
                         _ ->
                            Default
                     end
             end;
-        {ok,TopicAtom} when is_atom(TopicAtom), TopicAtom =/= undefined->
-            TopicAtom;
-        {ok,Max} when is_integer(Max)->
-            Max;
+        {ok,TopicData} when TopicData =/= undefined->
+            TopicData;
         _ ->
             Default
     end.
@@ -424,6 +523,15 @@ get_pool_name({PoolName, Topic, Broker, PartitionId, Leader })->
 get_pool_name({Topic, Broker, PartitionId, Leader })->
     NextPoolName = {Topic, Broker, PartitionId, Leader },
     ekaf_utils:btoatom(ekaf_utils:itob(erlang:phash2(NextPoolName))).
+
+partitions(#ekaf_server{metadata = Metadata})->
+    partitions(Metadata);
+partitions(#ekaf_fsm{metadata = Metadata})->
+    partitions(Metadata);
+partitions(#metadata_response{ topics = [Topic|_] })->
+    partitions(Topic);
+partitions(#topic { partitions = Partitions }) ->
+    Partitions.
 
 fsm_next_state(StateName,State)->
     {next_state, StateName, State}.

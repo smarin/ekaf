@@ -63,7 +63,7 @@ Topic is a binary. and the payload can be a list, a binary, a key-value tuple, o
 
     %% sync
     {buffered, _Partition, _BufferSize} =
-        ekaf:produce_async_batched(
+        ekaf:produce_sync_batched(
             Topic,
             [ekaf_utils:itob(X) || X<- lists:seq(1,1000) ]
         ).
@@ -75,17 +75,30 @@ Topic is a binary. and the payload can be a list, a binary, a key-value tuple, o
             [<<"foo">>, {<<"key">>, <<"value">>}, <<"back_to_binary">> ]
         ).
 
+    %% send entire batch as a list of events
+    application:set_env(ekaf, ?EKAF_CALLBACK_MASSAGE_BUFFER,
+                              {ekaf_callbacks, 
+                               encode_messages_as_one_large_json}),
+
+
+    %% route to a partition based on a key or list of tuples ( see below on default, custom logic)
+    ekaf:produce_async(<<"topic">>, {<<"user1">>,<<"foobar">>}). 
+    ekaf:produce_sync(<<"topic">>, [{<<"user1">>, <<"foo">>},  {<<"user2">>, <<"bar">>}]).
+    ekaf:produce_async_batched(...
+    
+
     %%------------------------
     %% Other helpers that are used internally
     %%------------------------
-    %% reads ekaf_bootstrap_topics. Will also start their workers
-    ekaf:prepare(Topic).
     %% metadata
     %% if you don't want to start workers on app start, make sure to
     %%               first get metadata before any produce/publish
     ekaf:metadata(Topic).
+
     %% pick a worker, and directly communicate with it
-    ekaf:pick(Topic,Callback).
+    ekaf:pick(Topic). %synchronous
+    ekaf:pick(Topic,Callback). %asynchronous
+
     %% see the tests for a complete API, and `ekaf.erl` and `ekaf_lib` for more
 
 See `test/ekaf_tests.erl` for more
@@ -196,11 +209,24 @@ eg: if you want every messages to go to a different partition, you may need 1 wo
 
 eg: if you have 100 workers per partition and have chosen strict_round_robin, the first 100 events will go to partition1, the next 100 to partition 2, etc
 
-Again, you can configure the same strategy for all topics, or pick different for different topics
+#### custom
+
+If this strategy has been decided (can be configured for all topics, or for specific topics) then all messages of a tuple form {Key,Bin} will be passed to a function to decide the partition based on Key
+
+    ekaf:produce_async_batched(<<"topic">>, {<<"user1">>,<<"foobar">>}).
+    ekaf:produce_sync(<<"topic">>, [{<<"user1">>, <<"foo">>},  {<<"user2">>, <<"bar">>}]).
+    % internally if there are 5 partitions then `erlang:phash2(<<"user1">>) rem 5` is done
+    % to choose a partition. within the partition, workers are again 
+    % round robin'd even when publishing to the same Key. But you can over-ride the
+    % default ekaf_callbacks:default_custom_partition_picker/3 implementation
+
+
+NOTE: You can configure the same strategy for all topics, or pick different for different topics
 
     {ekaf_partition_strategy, [
      {<<"heavy_job">>, strict_round_robin},
      {<<"other_event">>, sticky_round_robin},
+     {<<"user_actions">>, custom}, %route to partition based on message key
      {ekaf_partition_strategy,  random}      %% default
     ]}
 
@@ -210,14 +236,37 @@ Does not need a connection to Zookeeper for broker info, etc. This adopts the pa
 ### No linked drivers, No NIF's, Minimal Deps.   ###
 Deals with the protcol completely in erlang. Pattern matching FTW, see the blogpost that inspired this project ( also see https://coderwall.com/p/1lyfxg ). Uses gproc for process registry.
 
+### Option to re-use worker pool as statsd worker pool to push metrics
+In production having when 100's of workers pushing to your favorite statsd client, you may find your statsd client becomeing a bottleneck. Enabling the `?EKAF_PUSH_TO_STATSD_ENABLED` at a global or topic level, allows each worker to maintain reference to a UDP socket, so that pushing metrics is naturally load balanced.Enabling this option does not begin sending metrics automatically. Your callback needs to do so like shown below.
+
+    % Set the ekaf app options before ekaf starts (or in your config file)
+    % to enable the push to statsd option (since 1.5.4), register your callback
+    application:set_env(ekaf, ?EKAF_PUSH_TO_STATSD_ENABLED, true),
+    application:set_env(ekaf, ?EKAF_CALLBACK_FLUSH_ATOM,  {ekaf_demo, demo_callback}),
+    
+    % Then to get the metric ekaf.events.broker1.0 => N do
+    
+    demo_callback(Event, _From, _StateName, 
+                #ekaf_fsm{ topic = Topic, partition = PartitionId, last_known_size = BufferLength, leader = Leader} = _State,
+                Extra)->
+    
+        Stat = <<Topic/binary,".",  Event/binary, ".broker", (ekaf_utils:itob(Leader))/binary, ".", (ekaf_utils:itob(PartitionId))/binary>>,
+        case Event of
+        ?EKAF_CALLBACK_FLUSH ->
+            ekaf_stats:udp_gauge(_State#ekaf_fsm.statsd_socket,
+                                 Stat,
+                                 BufferLength),
+            ok;
+
 ### Optimized for using on a cluster ###
 * Works well if embedding into other OTP/rebar style apps ( eg: tested with `kafboy`)
 * Only gets metadata for the topic being published. ekaf does not start workers until a produce is called, hence easily horizontally scalable - can be added to a load balancer without worrying about creating holding up valuable connections to a broker on bootup. Queries metadata directly from a `{ekaf_bootstrap_broker,Broker}` during the first produce to a topic, and then caches this data for that topic.
 * Extensive use of records for `O(1)` lookup
 * By using binary as the preferred format for Topic, etc, - lists are avoided in all places except the `{BrokerHost,_Port}`.
+* All pg2 and gproc names are prefixed with <<"ekaf.",Topic/binary>> for better namespacing
 
-### Concurrency when publishing to multiple topics via process groups ###
-Each Topic, will have a pg2 process group, You can pick a random partition worker for a topic via
+### Concurrency when publishing to multiple topics ###
+Each Topic, will have a pg2 process group, but maintaining the pool is done internally for maintaining round-robin, etc. You can pick a random partition worker for a topic via
 
     ekaf:pick(<<"topic_foo">>, fun(Worker) ->
         case Worker of
@@ -231,6 +280,7 @@ Each Topic, will have a pg2 process group, You can pick a random partition worke
     end).
 
     %% pick/1 and pick/2 also exist for synchronously choosing a worker
+    %% picking a worker based on the data is a new functionality added in 1.6.0
 
 ### Fault tolerant
 
@@ -257,32 +307,17 @@ Current callbacks include when the buffer is flushed.
     ]}.
 
     %% mystats.erl
-    callback_flush(Topic, Broker, PartitionId, BufferLength, From, CorId)->
-        spawn(fun()->
-                  %io:format("~n flush broker: ~p partition ~p when size was ~p corid ~p worker: ~p",[Broker, PartitionId, Len, CorId, From]),
-                  % eg:          flush partition 0, when size was 5025 corid 8899
+    demo_callback(Event, _From, _StateName,
+		#ekaf_fsm{ topic = Topic, broker = _Broker, partition = PartitionId, last_known_size = BufferLength, cor_id = CorId, leader = Leader},
+		Extra)->
+	Stat = <<Topic/binary,".",  Event/binary, ".broker", (ekaf_utils:itob(Leader))/binary, ".", (ekaf_utils:itob(PartitionId))/binary>>,
+	case Event of
+	  ?EKAF_CALLBACK_FLUSH ->
+		io:format("~n ~p flush broker~w#~p when size was ~p corid ~p via:~p",
+                          [Topic, Leader, PartitionId, BufferLength, CorId, _From]);
+	...
 
-                  % histogram gives rates/sec
-                  statman_histogram:record_value({<<"/ekaf.",Topic/binary>>,<<"partition.", (ekaf_utils:itob(PartitionId))/binary,".flushed">>}, CorId),
-
-                  % gauges for values
-                  statman_gauge:set({<<"ekaf.",Topic/binary>>,<<"partition.", (ekaf_utils:itob(PartitionId))/binary,".batch.size">>}, Len),
-                  statman_gauge:set({<<"ekaf.",Topic/binary>>,<<"partition.", (ekaf_utils:itob(PartitionId))/binary,".sent">>}, CorId)
-        end).
-
-Here is an example of instrumenting ekaf with the included `ekaf_stats` module and `statman` ( https://github.com/knutin/statman_elli )...
-
-    {ok, _} = statman_poller_sup:add_gauge(fun()-> ekaf_lib:instrument_topics(<<"events">>) end, 5000),
-    {ok, _} = statman_poller_sup:add_gauge(fun()-> ekaf_lib:get_info(<<"events">>, <<"buffer.size">>) end, 5000),
-    {ok, _} = statman_poller_sup:add_gauge(fun()-> ekaf_lib:get_info(<<"events">>, <<"buffer.max">>) end, 5000),
-    {ok, _} = statman_poller_sup:add_gauge( fun statman_vm_metrics:get_gauges/0),
-    ok.
-
-...will generate gauges on statman like this.
-
-![screenshot-instrumentable](/benchmarks/screenshot-ekaf-instrumentable-eg-statman.png)
-
-We have changed this to work with statsite/statsd/grafana as well.
+The first argument being binary, can easily be pushed into statsite/statsd/graphite/grafana
 
 ### State Machines ###
 Each worker is a finite state machine powered by OTP's gen_fsm as opposed to gen_server which is more of a client-server model. Which makes it easy to handle connections breaking, and adding more features in the future. In fact every new topic spawns a worker that first starts in a bootstrapping state until metadata is retrieved. This is a blocking call.
@@ -322,8 +357,13 @@ Choosing a worker is done by a worker of `ekaf_server` for every topic. It looks
         % else the default is random
 
         % optional
-        {ekaf_callback_flush, {mystats,callback_flush}}
+        {ekaf_callback_flush, {mystats,callback_flush}},
         % can be used for instrumentating how how batches are sent & hygeine
+
+        % optional
+        {ekaf_callback_custom_partition_picker, {ekaf_callbacks, 
+                                                 default_custom_partition_picker}} 
+        % to always route messages with keys to the same partition
 
     ]},
 
@@ -380,61 +420,48 @@ ekaf works well with rebar.
     $ rebar get-deps clean compile eunit
     
     ==> ekaf (eunit)
-    Compiled src/ekaf_sup.erl
-    Compiled src/ekaf_socket.erl
-    Compiled src/ekaf_utils.erl
-    Compiled src/ekaf_server_lib.erl
-    Compiled src/ekaf_server.erl
-    Compiled src/ekaf_protocol_metadata.erl
-    Compiled src/ekaf_protocol_produce.erl
-    Compiled src/ekaf_picker.erl
-    Compiled src/ekaf_protocol.erl
-    Compiled src/ekaf_demo.erl
-    Compiled src/ekaf_fsm.erl
-    Compiled src/ekaf_callbacks.erl
-    Compiled src/ekaf_lib.erl
-    Compiled src/ekaf.erl
-    Compiled test/ekaf_tests.erl
-    test/ekaf_tests.erl:87:<0.496.0>: t_pick_from_new_pool ( ) = ok
-    test/ekaf_tests.erl:89:<0.513.0>: t_request_metadata ( ) = ok
-    test/ekaf_tests.erl:91:<0.517.0>: t_request_worker_state ( ) = ok
-    test/ekaf_tests.erl:94:<0.521.0>: t_produce_sync_to_topic ( ) = ok
-    test/ekaf_tests.erl:96:<0.527.0>: t_produce_sync_multi_to_topic ( ) = ok
-    test/ekaf_tests.erl:98:<0.533.0>: t_produce_sync_in_batch_to_topic ( ) = ok
-    test/ekaf_tests.erl:100:<0.540.0>: t_produce_sync_multi_in_batch_to_topic ( ) = ok
-    test/ekaf_tests.erl:103:<0.547.0>: t_produce_async_to_topic ( ) = ok
-    test/ekaf_tests.erl:105:<0.554.0>: t_produce_async_multi_to_topic ( ) = ok
-    test/ekaf_tests.erl:107:<0.561.0>: t_produce_async_in_batch_to_topic ( ) = ok
-    test/ekaf_tests.erl:109:<0.569.0>: t_produce_async_multi_in_batch_to_topic ( ) = ok
-    test/ekaf_tests.erl:112:<0.577.0>: t_max_messages_to_save_during_kafka_downtime ( ) = ok
-    test/ekaf_tests.erl:114:<0.595.0>: t_restart_kafka_broker ( ) = ok
-    test/ekaf_tests.erl:116:<0.608.0>: t_change_kafka_config ( ) = ok
-    All 28 tests passed.
+    test/ekaf_tests.erl:87:<0.174.0>: t_reading_topic_specific_envs ( ) = ok
+    test/ekaf_tests.erl:89:<0.181.0>: t_pick_from_new_pool ( ) = ok
+    test/ekaf_tests.erl:91:<0.195.0>: t_request_metadata ( ) = ok
+    test/ekaf_tests.erl:93:<0.199.0>: t_request_worker_state ( ) = ok
+    test/ekaf_tests.erl:96:<0.203.0>: t_produce_sync_to_topic ( ) = ok
+    test/ekaf_tests.erl:98:<0.209.0>: t_produce_sync_multi_to_topic ( ) = ok
+    test/ekaf_tests.erl:100:<0.215.0>: t_produce_sync_in_batch_to_topic ( ) = ok
+    test/ekaf_tests.erl:102:<0.222.0>: t_produce_sync_multi_in_batch_to_topic ( ) = ok
+    test/ekaf_tests.erl:105:<0.229.0>: t_produce_async_to_topic ( ) = ok
+    test/ekaf_tests.erl:107:<0.236.0>: t_produce_async_multi_to_topic ( ) = ok
+    test/ekaf_tests.erl:109:<0.243.0>: t_produce_async_in_batch_to_topic ( ) = ok
+    test/ekaf_tests.erl:111:<0.251.0>: t_produce_async_multi_in_batch_to_topic ( ) = ok
+    test/ekaf_tests.erl:114:<0.259.0>: t_max_messages_to_save_during_kafka_downtime ( ) = ok
+    test/ekaf_tests.erl:116:<0.277.0>: t_restart_kafka_broker ( ) = ok
+    test/ekaf_tests.erl:118:<0.290.0>: t_change_kafka_config ( ) = ok
+    test/ekaf_tests.erl:120:<0.324.0>: t_massage_buffer_encode_messages_as_one_large_message ( ) = ok
+    All 32 tests passed.
+    Cover analysis: /Users/bosky/testbed/ekaf/.eunit/index.html
     
-    Cover analysis: /data/repos/ekaf/.eunit/index.html
-
     Code Coverage:
-    ekaf                   : 61%
-    ekaf_callbacks         : 100
+    ekaf                   : 51%
+    ekaf_callbacks         : 87%
     ekaf_demo              :  0%
-    ekaf_fsm               : 57%
-    ekaf_lib               : 63%
+    ekaf_fsm               : 53%
+    ekaf_lib               : 62%
     ekaf_picker            : 68%
     ekaf_protocol          : 70%
     ekaf_protocol_metadata : 78%
     ekaf_protocol_produce  : 68%
-    ekaf_server            : 39%
-    ekaf_server_lib        : 47%
-    ekaf_socket            : 47%
+    ekaf_server            : 43%
+    ekaf_server_lib        : 64%
+    ekaf_socket            : 57%
     ekaf_sup               : 33%
     ekaf_utils             : 14%
-
-    Total                  : 48%
+    
+    Total                  : 50%
+    
 
 ## License
 
 ```
-Copyright 2014, Helpshift, Inc.
+Copyright 2015, Helpshift, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -449,6 +476,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### Goals for v2.0 ###
+### Goals for v2.0.0 ###
 * Compression when publishing
 * Add a feature request at https://github.com/helpshift/ekaf or check the ekaf web server at https://github.com/helpshift/kafboy

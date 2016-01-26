@@ -1,7 +1,9 @@
 -module(ekaf_picker).
 -export([pick/1, pick/2, pick/3, pick/4]).
 -export([pick_sync/3, pick_sync/4,
-        pick_async/2, join_group_if_not_present/2]).
+        pick_async/2, join_group_if_not_present/2,
+
+        pick_first_matching/3]).
 
 -include("ekaf_definitions.hrl").
 
@@ -40,7 +42,8 @@ pick(Topic, Callback, Mode, Strategy) ->
     end.
 
 pick_async(Topic,Callback)->
-    RegName = (catch gproc:where({n,l,Topic})),
+    PrefixedTopic = ?PREFIX_EKAF(Topic),
+    RegName = (catch gproc:where({n,l,PrefixedTopic})),
     TempCallback = fun(_With)->
                            Pid = spawn(fun()->
                                                receive
@@ -50,7 +53,7 @@ pick_async(Topic,Callback)->
                                                        {error, _UE}
                                                end
                                        end),
-                           gproc:send({n,l,Topic}, {pick, Topic, Pid})
+                           gproc:send({n,l,PrefixedTopic}, {pick, Topic, Pid})
                    end,
     case RegName of
         {'EXIT',Reason} ->
@@ -69,7 +72,7 @@ pick_sync(_Topic, _Callback, ketama, _Attempt)->
     error;
 %% if strategy is sticky_round_robin or strict_round_robin or random
 pick_sync(Topic, Callback, _Strategy, _Attempt)->
-    case pg2:get_closest_pid(Topic) of
+    case pg2:get_closest_pid(?PREFIX_EKAF(Topic)) of
         PoolPid when is_pid(PoolPid) ->
             handle_callback(Callback,PoolPid);
         {error, {no_process,_}}->
@@ -88,10 +91,22 @@ handle_callback(Callback, Pid)->
     end.
 
 join_group_if_not_present(PG, Pid)->
-    Pids = pg2:get_members(PG),
+    Pids = pg2:get_local_members(PG),
     case lists:member(Pid, Pids) of
         true ->
             ok;
         _ ->
             pg2:join(PG, Pid)
+    end.
+
+pick_first_matching([], _, DefaultWorker)->
+    DefaultWorker;
+pick_first_matching([Worker|Workers], Pred, DefaultWorker)->
+    case (catch Pred(Worker)) of
+        true ->
+            Worker;
+        false ->
+            pick_first_matching(Workers, Pred, DefaultWorker);
+        _ ->
+            DefaultWorker
     end.

@@ -63,12 +63,14 @@ start_link(Name,Args) ->
 %% until then queue up tasks
 init([Topic])->
     Self = self(),
+    PrefixedTopic = ?PREFIX_EKAF(Topic),
     State = generic_init(Topic),
-    gproc:reg({n,l,Topic},[]),
-    pg2:create(Topic),
-    ekaf_picker:join_group_if_not_present(Topic, self()),
-    gen_fsm:send_event(self(), connect),
-    {ok, downtime, State#ekaf_server{topic = Topic, worker = Self}};
+    gproc:reg({n,l,PrefixedTopic},[]),
+    pg2:create(PrefixedTopic),
+    ekaf_picker:join_group_if_not_present(PrefixedTopic, Self),
+    gen_fsm:send_event(Self, connect),
+    StatsSocket = ekaf_lib:open_socket_if_statsd_enabled(Topic),
+    {ok, downtime, State#ekaf_server{topic = Topic, worker = Self, statsd_socket = StatsSocket}};
 init(_Args) ->
     State = generic_init(any),
     {ok, downtime, State}.
@@ -94,12 +96,16 @@ downtime(connect, #ekaf_server{ broker = Broker, time = T1 } = State)->
     case ekaf_socket:open(Broker) of
         {ok, Socket} ->
             T2 = os:timestamp(),
-            ekaf_callbacks:call(?EKAF_CALLBACK_TIME_DOWN, self(), downtime, State, {ok,timer:now_diff(T2, T1)}),
+            ekaf_callbacks:call(?EKAF_CALLBACK_TIME_DOWN_ATOM,
+                                ?EKAF_CALLBACK_TIME_DOWN,
+                                self(), downtime, State, {ok,timer:now_diff(T2, T1)}),
             %% connection good, ask for metadata
             gen_fsm:send_event(self(), {metadata, req, Socket}),
             fsm_next_state(downtime, State#ekaf_server{ socket = Socket });
         {error, Reason} ->
-            ekaf_callbacks:call(?EKAF_CALLBACK_WORKER_STILL_DOWN, self(), downtime, State, Reason),
+            ekaf_callbacks:call(?EKAF_CALLBACK_WORKER_STILL_DOWN_ATOM,
+                                ?EKAF_CALLBACK_WORKER_STILL_DOWN,
+                                self(), downtime, State, Reason),
             ekaf_server_lib:reconnect_attempt(),
             fsm_next_state(downtime, State)
     end;
@@ -217,7 +223,7 @@ ready({timeout, Timer, <<"refresh">> = TimeoutKey}, #ekaf_server{
                        {error,_}->
                            State#ekaf_server{ ctr = 0 };
                        {NextWorker, NextState} when Strategy =:= strict_round_robin->
-                           Members = pg2:get_members(Topic),
+                           Members = pg2:get_local_members(?PREFIX_EKAF(Topic)),
                            NextWorkers = case Workers of [] -> Members; _ -> case State#ekaf_server.workers -- Members of [] -> Workers; _ -> Members end end,
                            NextState#ekaf_server{ ctr = 0, worker = NextWorker, workers =  NextWorkers};
                        {NextWorker, NextState} ->
@@ -243,7 +249,10 @@ ready(Msg, State) ->
 %%--------------------------------------------------------------------
 ready(info, _From, State)->
     Reply = State,
-    {reply, Reply, State};
+    {reply, Reply, ready, State};
+ready(workers, _From, State)->
+    Reply = State#ekaf_server.workers,
+    {reply, Reply, ready, State};
 ready({produce_sync, Messages}, _From, State)->
     ekaf_server_lib:save_messages(ready, State, Messages);
 ready(prepare, From, #ekaf_server{ kv = KV } = State)->
@@ -330,12 +339,58 @@ handle_info({pick, _Topic, Callback}, ready, #ekaf_server{ strategy = strict_rou
 handle_info({pick, _Topic, Callback}, ready, #ekaf_server{ strategy = sticky_round_robin, worker = Worker, ctr = Ctr } = State) ->
     Callback ! {ok, Worker},
     fsm_next_state(ready, State#ekaf_server{ ctr = Ctr + 1});
+%% if this strategy has been decided (can be configured for all topics, or for specific topics)
+%% then all messages of a tuple form {Key,Bin} will be passed to a function to decide the partition based on Key
+handle_info({pick, Data, Callback}, ready, #ekaf_server{ topic = Topic, strategy = custom,
+                                                         workers = [FirstWorker|RestWorkers] = Workers} = State) ->
+    {M,F} = ekaf_lib:get_default(Topic, ?EKAF_CALLBACK_CUSTOM_PARTITION_PICKER_ATOM, {ekaf_callbacks, default_custom_partition_picker}),
+    {FinalWorker, Next} =
+        case (catch M:F(Topic, Data, State)) of
+            %% the custom partition cannot or chose not to send the message
+            {error,_} = _E ->
+                {_E, State};
+
+            %% the partitioner knows which partition to use
+            {partition, Partition} ->
+                Pred = fun(SomeWorker)->
+                               Partition =:= gen_fsm:sync_send_event(SomeWorker, partition)
+                       end,
+
+                % round robin a worker from the chosen partition
+                CustomWorker = ekaf_picker:pick_first_matching(Workers, Pred, FirstWorker),
+                CustomState = State#ekaf_server{ workers = lists:append(Workers--[CustomWorker],
+                                                                        [CustomWorker])},
+
+                {CustomWorker,CustomState};
+
+            %% the partitioner knows exactly the worker to use
+            {worker, CustomWorker, CustomWorkers} ->
+                CustomState = State#ekaf_server{ workers = CustomWorkers },
+                {CustomWorker, CustomState};
+
+            _ ->
+                %% the custom partition gives up, and wants us to decide
+                %% similiar to round robin
+                {FirstWorker,
+                 State#ekaf_server{ workers = lists:append(RestWorkers,[FirstWorker])}}
+        end,
+
+    case FinalWorker of
+        {error,_} = Er ->
+            %% don't send the message because of an error
+            Callback ! Er;
+        _ ->
+            Callback ! {ok, FinalWorker}
+    end,
+    fsm_next_state(ready, Next);
 handle_info({pick, _Topic, Callback}, ready, #ekaf_server{ worker = Worker} = State) ->
     Callback ! {ok, Worker},
     fsm_next_state(ready, State);
 handle_info({pick, _, Callback}, StateName, State)->
     Callback ! {ok, self()},
     fsm_next_state(StateName, State);
+handle_info({worker, enqueue, Worker}, ready, #ekaf_server{ workers = Workers} = State) ->
+    fsm_next_state(ready, State#ekaf_server{ workers = lists:append(Workers--[Worker],[Worker])} );
 handle_info({worker, down, WorkerDown, WorkerId, WorkerDownStateName, WorkerDownState, WorkerDownReason}, _StateName, #ekaf_server{ topic = Topic, worker = Worker, ongoing_metadata = RequestedMetadata, workers = Workers } =  State)->
     ekaf_lib:stop_child(WorkerId),
     case RequestedMetadata of
@@ -366,17 +421,19 @@ handle_info({worker, down, WorkerDown, WorkerId, WorkerDownStateName, WorkerDown
                      _ ->
                          Worker
                  end,
-    ekaf_callbacks:call(?EKAF_CALLBACK_WORKER_DOWN, WorkerDown, WorkerDownStateName, WorkerDownState, WorkerDownReason),
+    ekaf_callbacks:call(?EKAF_CALLBACK_WORKER_DOWN_ATOM,
+                        ?EKAF_CALLBACK_WORKER_DOWN,
+                        WorkerDown, WorkerDownStateName, WorkerDownState, WorkerDownReason),
     case NextWorkers of
         [] ->
-            ekaf_picker:join_group_if_not_present(Topic, self()),
+            ekaf_picker:join_group_if_not_present(?PREFIX_EKAF(Topic), self()),
             gen_fsm:send_event(self(), connect),
             fsm_next_state(downtime,State#ekaf_server { ongoing_metadata = true, workers = NextWorkers, worker = self(), time = os:timestamp() });
         _ ->
             fsm_next_state(ready, State#ekaf_server{ ongoing_metadata = true, workers = NextWorkers, worker = NextWorker, time = os:timestamp() } )
     end;
 handle_info({worker, up, WorkerUp, WorkerUpStateName, WorkerUpState, _}, StateName, #ekaf_server { topic = Topic, messages = OfflineMessages } = State) ->
-    pg2:leave(Topic, self()),
+    pg2:leave(?PREFIX_EKAF(Topic), self()),
     case StateName of
         ready ->
             ekaf_server_lib:send_messages(StateName, State, lists:reverse(OfflineMessages));
@@ -384,14 +441,14 @@ handle_info({worker, up, WorkerUp, WorkerUpStateName, WorkerUpState, _}, StateNa
             ok
     end,
 
-    case ekaf_callbacks:find(?EKAF_CALLBACK_WORKER_UP) of
+    case ekaf_callbacks:find(?EKAF_CALLBACK_WORKER_UP_ATOM) of
         {Mod,Func} ->
             Mod:Func(?EKAF_CALLBACK_WORKER_UP, WorkerUp, WorkerUpStateName, WorkerUpState, undefined);
         _ ->
             ok
     end,
     Next = ekaf_server_lib:reply_to_prepares(WorkerUp, State),
-    fsm_next_state(StateName, Next#ekaf_server{ worker = WorkerUp, messages = [], workers = pg2:get_members(Topic)});
+    fsm_next_state(StateName, Next#ekaf_server{ worker = WorkerUp, messages = [], workers = pg2:get_local_members(?PREFIX_EKAF(Topic))});
 handle_info({set, strategy, Value}, ready, State)->
     Next = State#ekaf_server{ strategy = Value },
     fsm_next_state(ready, Next);
@@ -421,7 +478,7 @@ handle_info(_Info, StateName, State) ->
 %% Returns: any
 %%--------------------------------------------------------------------
 terminate(_Reason, _StateName, #ekaf_server{ topic = Topic }) ->
-    pg2:delete(Topic),
+    pg2:delete(?PREFIX_EKAF(Topic)),
     ok.
 
 %%--------------------------------------------------------------------

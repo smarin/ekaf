@@ -9,6 +9,8 @@
 -define(EKAF_DEFAULT_BUFFER_TTL                  , 5000).
 -define(EKAF_DEFAULT_PARTITION_STRATEGY          , random).
 -define(EKAF_DEFAULT_PULL_FOR_CHANGES_TIMEOUT    , 60000).
+-define(EKAF_PUSH_TO_STATSD_ENABLED              , ekaf_push_to_statsd_enabled).
+-define(EKAF_DEFAULT_PUSH_TO_STATSD_ENABLED      , false).
 -define(EKAF_SYNC_TIMEOUT                        , 5000).
 
 %%======================================================================
@@ -34,17 +36,36 @@
 
 %%======================================================================
 %% Optional {Mod,Func} callbacks that can be set as an app env to ekaf
+%% NOTE: in your sys.config, and when calling set_env/3,
+%%       use the atoms. In the callbacks though,
+%%       you will get binary, to facilitate easy logging/metrics
 %%======================================================================
 -define(EKAF_CALLBACK_FLUSH                      , <<"ekaf_callback_flush">>).
+-define(EKAF_CALLBACK_FLUSH_ATOM                 ,    ekaf_callback_flush).
 -define(EKAF_CALLBACK_FLUSHED_REPLIED            , <<"ekaf_callback_flushed_replied">>).
+-define(EKAF_CALLBACK_FLUSHED_REPLIED_ATOM       ,    ekaf_callback_flushed_replied).
 -define(EKAF_CALLBACK_WORKER_DOWN                , <<"ekaf_callback_worker_down">>).
+-define(EKAF_CALLBACK_WORKER_DOWN_ATOM           ,    ekaf_callback_worker_down).
 -define(EKAF_CALLBACK_WORKER_STILL_DOWN          , <<"ekaf_callback_worker_still_down">>).
+-define(EKAF_CALLBACK_WORKER_STILL_DOWN_ATOM     ,    ekaf_callback_worker_still_down).
 -define(EKAF_CALLBACK_WORKER_UP                  , <<"ekaf_callback_worker_up">>).
+-define(EKAF_CALLBACK_WORKER_UP_ATOM             ,    ekaf_callback_worker_up).
 -define(EKAF_CALLBACK_DOWNTIME_SAVED             , <<"ekaf_callback_downtime_saved">>).
+-define(EKAF_CALLBACK_DOWNTIME_SAVED_ATOM        ,    ekaf_callback_downtime_saved).
 -define(EKAF_CALLBACK_DOWNTIME_REPLAYED          , <<"ekaf_callback_downtime_replayed">>).
+-define(EKAF_CALLBACK_DOWNTIME_REPLAYED_ATOM     ,    ekaf_callback_downtime_replayed).
 -define(EKAF_CALLBACK_TIME_TO_CONNECT            , <<"ekaf_callback_time_to_connect">>).
+-define(EKAF_CALLBACK_TIME_TO_CONNECT_ATOM       ,   ekaf_callback_time_to_connect).
 -define(EKAF_CALLBACK_TIME_DOWN                  , <<"ekaf_callback_time_down">>).
--define(EKAF_CALLBACK_MAX_DOWNTIME_BUFFER_REACHED, <<"ekaf_callback_max_downtime_buffer_reached">>).
+-define(EKAF_CALLBACK_TIME_DOWN_ATOM             ,    ekaf_callback_time_down).
+-define(EKAF_CALLBACK_MAX_DOWNTIME_BUFFER_REACHED  , <<"ekaf_callback_max_downtime_buffer_reached">>).
+-define(EKAF_CALLBACK_MAX_DOWNTIME_BUFFER_REACHED_ATOM, ekaf_callback_max_downtime_buffer_reached).
+%% the following callbacks are not side-effects
+-define(EKAF_CALLBACK_MASSAGE_BUFFER             , <<"ekaf_callback_massage_buffer">>).
+-define(EKAF_CALLBACK_MASSAGE_BUFFER_ATOM        ,    ekaf_callback_massage_buffer).
+-define(EKAF_CALLBACK_CUSTOM_PARTITION_PICKER    , <<"ekaf_callback_custom_partition_picker">>).
+-define(EKAF_CALLBACK_CUSTOM_PARTITION_PICKER_ATOM,   ekaf_callback_custom_partition_picker).
+
 
 %%======================================================================
 %% Macros
@@ -78,6 +99,8 @@
         end
        ).
 
+-define(PREFIX_EKAF(Str), <<"ekaf.",Str/binary>>).
+
 %%======================================================================
 %% Specs
 %%======================================================================
@@ -96,9 +119,47 @@
 %%======================================================================
 %% Records
 %%======================================================================
-%% Used by workers
--record(ekaf_server, {broker, strategy, worker, workers=[], topic, messages=[]::list(), socket, cor_id=0::integer(), max_buffer_size::integer(), max_downtime_buffer_size::integer(), kv, ctr=0::integer(), metadata, ongoing_metadata=false::boolean(), time}).
--record(ekaf_fsm, { id::integer(), topic::binary(), broker:: tuple(), partition::integer(), replica::integer(), leader::integer(), socket :: port(), pool::atom(), metadata, cor_id = 0 :: integer(), client_id = "ekaf", reply_to, buffer=[]::list(), max_buffer_size = 1, buffer_ttl = ?EKAF_DEFAULT_BUFFER_TTL, kv, to_buffer = true::boolean(), last_known_size :: integer(), topic_packet, partition_packet, produce_packet, time}).
+%% Used by each topic workers
+-record(ekaf_server, {broker,
+                      strategy,
+                      worker,
+                      workers=[],
+                      topic,
+                      messages=[]::list(),
+                      socket,
+                      cor_id=0::integer(),
+                      max_buffer_size::integer(),
+                      max_downtime_buffer_size::integer(),
+                      kv,
+                      ctr=0::integer(),
+                      metadata,
+                      ongoing_metadata=false::boolean(),
+                      time,
+                      statsd_socket}).
+%% Used by topic workers
+-record(ekaf_fsm, { id::integer(),
+                    topic::binary(),
+                    broker:: tuple(),
+                    partition::integer(),
+                    replica::integer(),
+                    leader::integer(),
+                    socket :: port(),
+                    pool::atom(),
+                    metadata,
+                    cor_id = 0 :: integer(),
+                    client_id = "ekaf",
+                    reply_to,
+                    buffer=[]::list(),
+                    max_buffer_size = 1,
+                    buffer_ttl = ?EKAF_DEFAULT_BUFFER_TTL,
+                    kv,
+                    to_buffer = true::boolean(),
+                    last_known_size :: integer(),
+                    topic_packet,
+                    partition_packet,
+                    produce_packet,
+                    time,
+                    statsd_socket}).
 
 
 %% Requests
