@@ -96,13 +96,15 @@ encode_partition(Partition) when is_integer(Partition)->
 encode_partition(#partition{ id = Id,  message_sets = MessageSets })->
     {ok, Codec} = ekaf_lib:get_compression_codec(),
     MessageSetsEncoded = case Codec of
-        gzip->
+        gzip ->
             MsgVal = zlib:gzip(encode_message_sets(MessageSets)),
             SecondMsgSet = #message_set{size = 1, messages = [#message{attributes = 1, key = undefined, value = MsgVal}]},
             encode_message_set(SecondMsgSet);
-        snappy->
-            %not implementing yet because I don't need it
-            encode_message_sets(MessageSets);
+        snappy ->
+            {ok, Ctx} = esnappy:create_ctx(),
+            MsgVal = esnappy:compress(Ctx, encode_message_sets(MessageSets)),
+            SecondMsgSet = #message_set{size = 1, messages = [#message{attributes = 2, key = undefined, value = MsgVal}]},
+            encode_message_sets(SecondMsgSet);
         _ ->
             encode_message_sets(MessageSets)
     end,
